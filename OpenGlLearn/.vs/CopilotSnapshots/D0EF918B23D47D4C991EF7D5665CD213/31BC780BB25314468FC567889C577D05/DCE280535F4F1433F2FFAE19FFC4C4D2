@@ -1,0 +1,373 @@
+﻿#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+
+// 简单数学类型与函数（最小实现，避免第三方依赖）
+struct Vec3 { float x, y, z; };
+struct Mat4 { float m[16]; };
+
+static Mat4 mat4Identity()
+{
+    Mat4 r{};
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+static Mat4 mat4Multiply(const Mat4& a, const Mat4& b)
+{
+    Mat4 r{};
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+        {
+            r.m[col + row * 4] =
+                a.m[0 + row * 4] * b.m[col + 0 * 4] +
+                a.m[1 + row * 4] * b.m[col + 1 * 4] +
+                a.m[2 + row * 4] * b.m[col + 2 * 4] +
+                a.m[3 + row * 4] * b.m[col + 3 * 4];
+        }
+    }
+    return r;
+}
+
+static Mat4 mat4Perspective(float fovyRadians, float aspect, float znear, float zfar)
+{
+    float f = 1.0f / std::tan(fovyRadians / 2.0f);
+    Mat4 r{};
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = (zfar + znear) / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = (2.0f * zfar * znear) / (znear - zfar);
+    return r;
+}
+
+static Mat4 mat4LookAt(const Vec3& eye, const Vec3& center, const Vec3& up)
+{
+    auto normalize = [](const Vec3& v) {
+        float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        return Vec3{ v.x / len, v.y / len, v.z / len };
+    };
+    auto cross = [](const Vec3& a, const Vec3& b) {
+        return Vec3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+    };
+    auto sub = [](const Vec3& a, const Vec3& b) { return Vec3{ a.x - b.x, a.y - b.y, a.z - b.z }; };
+    auto dot = [](const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+
+    Vec3 fwd = normalize(sub(center, eye));
+    Vec3 sx = normalize(cross(fwd, up));
+    Vec3 sy = cross(sx, fwd);
+
+    Mat4 r = mat4Identity();
+    r.m[0] = sx.x; r.m[4] = sx.y; r.m[8] = sx.z;
+    r.m[1] = sy.x; r.m[5] = sy.y; r.m[9] = sy.z;
+    r.m[2] = -fwd.x; r.m[6] = -fwd.y; r.m[10] = -fwd.z;
+
+    r.m[12] = -dot(sx, eye);
+    r.m[13] = -dot(sy, eye);
+    r.m[14] = dot(fwd, eye);
+
+    return r;
+}
+
+static Mat4 mat4RotateX(float radians)
+{
+    Mat4 r = mat4Identity();
+    float c = std::cos(radians);
+    float s = std::sin(radians);
+    r.m[5] = c; r.m[9] = -s;
+    r.m[6] = s; r.m[10] = c;
+    return r;
+}
+
+// 着色器源码
+static const char* orbitVS = R"GLSL(
+#version 330 core
+layout (location = 0) in vec2 aPos; // 单位圆 (x, z)
+uniform mat4 uMVP;
+uniform vec3 uCenter;
+uniform vec3 uScale; // x、y、z缩放（y不使用）
+uniform mat4 uTilt;
+void main()
+{
+    vec3 local = vec3(aPos.x * uScale.x, 0.0, aPos.y * uScale.z);
+    vec4 tilted = uTilt * vec4(local, 1.0);
+    vec3 world = uCenter + tilted.xyz;
+    gl_Position = uMVP * vec4(world, 1.0);
+}
+)GLSL";
+
+static const char* colorFS = R"GLSL(
+#version 330 core
+out vec4 FragColor;
+uniform vec3 uColor;
+void main()
+{
+    FragColor = vec4(uColor, 1.0);
+}
+)GLSL";
+
+static const char* pointVS = R"GLSL(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+uniform float uPointSize;
+void main()
+{
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    gl_PointSize = uPointSize;
+}
+)GLSL";
+
+static const char* pointFS = R"GLSL(
+#version 330 core
+out vec4 FragColor;
+uniform vec3 uColor;
+void main()
+{
+    // 圆形点精灵（丢弃圆外的片元）
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    if (dot(c, c) > 1.0) discard;
+    FragColor = vec4(uColor, 1.0);
+}
+)GLSL";
+
+static GLuint compileShader(GLenum type, const char* src)
+{
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok)
+    {
+        char log[1024]; GLsizei len = 0;
+        glGetShaderInfoLog(s, sizeof(log), &len, log);
+        std::cout << "Shader compile error: " << log << std::endl;
+    }
+    return s;
+}
+
+static GLuint linkProgram(GLuint vs, GLuint fs)
+{
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[1024]; GLsizei len = 0;
+        glGetProgramInfoLog(p, sizeof(log), &len, log);
+        std::cout << "Program link error: " << log << std::endl;
+    }
+    return p;
+}
+
+static void framebuffer_size_callback(GLFWwindow* window, int width, int height)
+{
+    glViewport(0, 0, width, height);
+}
+
+int main()
+{
+    // 初始化GLFW
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Sun-Earth-Moon", NULL, NULL);
+    if (window == NULL)
+    {
+        std::cout << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+    // 加载GLAD
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        std::cout << "Failed to initialize GLAD" << std::endl;
+        return -1;
+    }
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // 编译/链接着色器
+    GLuint orbitVSObj = compileShader(GL_VERTEX_SHADER, orbitVS);
+    GLuint colorFSObj = compileShader(GL_FRAGMENT_SHADER, colorFS);
+    GLuint orbitProg = linkProgram(orbitVSObj, colorFSObj);
+
+    GLuint pointVSObj = compileShader(GL_VERTEX_SHADER, pointVS);
+    GLuint pointFSObj = compileShader(GL_FRAGMENT_SHADER, pointFS);
+    GLuint pointProg = linkProgram(pointVSObj, pointFSObj);
+
+    glDeleteShader(orbitVSObj);
+    glDeleteShader(colorFSObj);
+    glDeleteShader(pointVSObj);
+    glDeleteShader(pointFSObj);
+
+    // 生成单位圆（复用画地球和月亮的轨道）
+    const int CIRCLE_SEG = 256;
+    std::vector<float> circle;
+    circle.reserve(CIRCLE_SEG * 2);
+    for (int i = 0; i < CIRCLE_SEG; ++i)
+    {
+        float t = (float)i / (float)CIRCLE_SEG * 2.0f * 3.1415926f;
+        circle.push_back(std::cos(t));
+        circle.push_back(std::sin(t));
+    }
+    GLuint orbitVAO = 0, orbitVBO = 0;
+    glGenVertexArrays(1, &orbitVAO);
+    glGenBuffers(1, &orbitVBO);
+    glBindVertexArray(orbitVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, orbitVBO);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(circle.size() * sizeof(float)), circle.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // 单点VAO/VBO（绘制太阳/地球/月亮）
+    GLuint pointVAO = 0, pointVBO = 0;
+    glGenVertexArrays(1, &pointVAO);
+    glGenBuffers(1, &pointVBO);
+    glBindVertexArray(pointVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, pointVBO);
+    float initPoint[3] = { 0.0f, 0.0f, 0.0f };
+    glBufferData(GL_ARRAY_BUFFER, sizeof(initPoint), initPoint, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    auto setMat4 = [](GLuint prog, const char* name, const Mat4& m) {
+        GLint loc = glGetUniformLocation(prog, name);
+        glUniformMatrix4fv(loc, 1, GL_FALSE, m.m);
+    };
+    auto setVec3 = [](GLuint prog, const char* name, float x, float y, float z) {
+        GLint loc = glGetUniformLocation(prog, name);
+        glUniform3f(loc, x, y, z);
+    };
+    auto setFloat = [](GLuint prog, const char* name, float v) {
+        GLint loc = glGetUniformLocation(prog, name);
+        glUniform1f(loc, v);
+    };
+
+    // 相机矩阵
+    Mat4 proj = mat4Perspective(45.0f * 3.1415926f / 180.0f, (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+    Mat4 view = mat4LookAt({ 0.0f, 6.0f, 12.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
+    Mat4 vp = mat4Multiply(proj, view);
+
+    // 轨道参数
+    const float earthA = 4.0f, earthB = 3.2f; // 地球绕太阳椭圆（XZ平面）
+    const float moonA = 1.0f, moonB = 0.7f;   // 月亮绕地球椭圆
+    const float moonTiltDeg = 20.0f;          // 月球轨道倾角（不共面）
+    const float earthPeriod = 20.0f;          // 地球一周20s
+    const float moonPeriod = 2.0f;            // 月亮一周2s（相对较快）
+
+    // 渲染循环
+    while (!glfwWindowShouldClose(window))
+    {
+        // 处理输入
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(window, true);
+
+        int w, h; glfwGetFramebufferSize(window, &w, &h);
+        glViewport(0, 0, w, h);
+        glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        float t = (float)glfwGetTime();
+        float angEarth = t * (2.0f * 3.1415926f / earthPeriod);
+        float angMoon = t * (2.0f * 3.1415926f / moonPeriod);
+
+        // 计算位置
+        Vec3 sunPos{ 0.0f, 0.0f, 0.0f };
+        Vec3 earthPos{ earthA * std::cos(angEarth), 0.0f, earthB * std::sin(angEarth) };
+        Vec3 moonLocal{ moonA * std::cos(angMoon), 0.0f, moonB * std::sin(angMoon) };
+        Mat4 tilt = mat4RotateX(moonTiltDeg * 3.1415926f / 180.0f);
+        // 应用倾角到月亮局部位置
+        Vec3 moonTilted{
+            moonLocal.x,
+            moonLocal.y * std::cos(moonTiltDeg * 3.1415926f / 180.0f) - moonLocal.z * std::sin(moonTiltDeg * 3.1415926f / 180.0f),
+            moonLocal.y * std::sin(moonTiltDeg * 3.1415926f / 180.0f) + moonLocal.z * std::cos(moonTiltDeg * 3.1415926f / 180.0f)
+        };
+        Vec3 moonPos{ earthPos.x + moonTilted.x, earthPos.y + moonTilted.y, earthPos.z + moonTilted.z };
+
+        // 更新MVP（如窗口大小变更）
+        proj = mat4Perspective(45.0f * 3.1415926f / 180.0f, (float)w / (float)h, 0.1f, 100.0f);
+        view = mat4LookAt({ 0.0f, 6.0f, 12.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
+        vp = mat4Multiply(proj, view);
+
+        // 画地球轨道（白色）
+        glUseProgram(orbitProg);
+        setMat4(orbitProg, "uMVP", vp);
+        setVec3(orbitProg, "uCenter", 0.0f, 0.0f, 0.0f);
+        setVec3(orbitProg, "uScale", earthA, 1.0f, earthB);
+        setMat4(orbitProg, "uTilt", mat4Identity());
+        setVec3(orbitProg, "uColor", 0.8f, 0.8f, 0.8f);
+        glBindVertexArray(orbitVAO);
+        glDrawArrays(GL_LINE_LOOP, 0, CIRCLE_SEG);
+
+        // 画月亮轨道（相对地球，绿色，并有倾角）
+        setMat4(orbitProg, "uMVP", vp);
+        setVec3(orbitProg, "uCenter", earthPos.x, earthPos.y, earthPos.z);
+        setVec3(orbitProg, "uScale", moonA, 1.0f, moonB);
+        setMat4(orbitProg, "uTilt", tilt);
+        setVec3(orbitProg, "uColor", 0.4f, 1.0f, 0.4f);
+        glBindVertexArray(orbitVAO);
+        glDrawArrays(GL_LINE_LOOP, 0, CIRCLE_SEG);
+
+        // 画太阳（黄色）、地球（蓝色）、月亮（灰白）
+        glUseProgram(pointProg);
+        setMat4(pointProg, "uMVP", vp);
+
+        glBindVertexArray(pointVAO);
+
+        // 太阳
+        glBindBuffer(GL_ARRAY_BUFFER, pointVBO);
+        float sunArr[3] = { sunPos.x, sunPos.y, sunPos.z };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(sunArr), sunArr);
+        setVec3(pointProg, "uColor", 1.0f, 0.9f, 0.2f);
+        setFloat(pointProg, "uPointSize", 28.0f);
+        glDrawArrays(GL_POINTS, 0, 1);
+
+        // 地球
+        float earthArr[3] = { earthPos.x, earthPos.y, earthPos.z };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(earthArr), earthArr);
+        setVec3(pointProg, "uColor", 0.2f, 0.6f, 1.0f);
+        setFloat(pointProg, "uPointSize", 12.0f);
+        glDrawArrays(GL_POINTS, 0, 1);
+
+        // 月亮
+        float moonArr[3] = { moonPos.x, moonPos.y, moonPos.z };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(moonArr), moonArr);
+        setVec3(pointProg, "uColor", 0.8f, 0.8f, 0.85f);
+        setFloat(pointProg, "uPointSize", 8.0f);
+        glDrawArrays(GL_POINTS, 0, 1);
+
+        glBindVertexArray(0);
+
+        // 交换缓冲
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // 释放资源
+    glDeleteVertexArrays(1, &orbitVAO);
+    glDeleteBuffers(1, &orbitVBO);
+    glDeleteVertexArrays(1, &pointVAO);
+    glDeleteBuffers(1, &pointVBO);
+    glDeleteProgram(orbitProg);
+    glDeleteProgram(pointProg);
+
+    glfwTerminate();
+    return 0;
+}

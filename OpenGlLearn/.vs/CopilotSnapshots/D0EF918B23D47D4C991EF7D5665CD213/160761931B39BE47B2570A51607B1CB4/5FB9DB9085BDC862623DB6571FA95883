@@ -1,0 +1,393 @@
+﻿//////////////////////////////////////////////////////////////////////////////
+//  ThreeBody.cpp
+//  日地月运动模型动画
+//  - 球体绘制（太阳、地球、月亮）
+//  - 椭圆轨道绘制（地球轨道XZ平面，月亮轨道有倾角）
+//  - 方向键/W/S控制摄像机视角
+//////////////////////////////////////////////////////////////////////////////
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <iostream>
+#include <vmath.h>
+#include <vector>
+
+//窗口大小参数
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+float aspact = (float)4.0 / (float)3.0;
+
+// 摄像机参数
+float camX = 0.0f, camY = 6.0f, camZ = 12.0f;
+
+//球体和轨道数据参数
+std::vector<float> sphereVertices;
+std::vector<int> sphereIndices;
+std::vector<float> earthOrbitVertices;
+std::vector<float> moonOrbitVertices;
+GLuint vertex_array_object, vertex_buffer_object, element_buffer_object;
+GLuint earthOrbitVAO = 0, earthOrbitVBO = 0;
+GLuint moonOrbitVAO = 0, moonOrbitVBO = 0;
+int shader_program;
+const int Y_SEGMENTS = 20;
+const int X_SEGMENTS = 20;
+const int ORBIT_SEGMENTS = 256;
+const float Radio = 3.0;
+const GLfloat PI = 3.14159265358979323846f;
+
+void print_controls() {
+    std::cout << "\n==== 控制说明 ====" << std::endl;
+    std::cout << "方向键↑↓←→：移动摄像机视角（上下左右）" << std::endl;
+    std::cout << "W/S：摄像机前后移动" << std::endl;
+    std::cout << "1：线框模式  2：填充模式" << std::endl;
+    std::cout << "3：开启背面剔除  4：关闭背面剔除" << std::endl;
+    std::cout << "ESC：退出程序" << std::endl;
+    std::cout << "=================\n" << std::endl;
+}
+
+void initial(void)
+{
+    // 球体顶点生成
+    for (int y = 0; y <= Y_SEGMENTS; y++)
+        for (int x = 0; x <= X_SEGMENTS; x++) {
+            float xSegment = (float)x / (float)X_SEGMENTS;
+            float ySegment = (float)y / (float)Y_SEGMENTS;
+            float xPos = std::cos(xSegment * Radio * PI) * std::sin(ySegment * PI);
+            float yPos = std::cos(ySegment * PI);
+            float zPos = std::sin(xSegment * Radio * PI) * std::sin(ySegment * PI);
+            sphereVertices.push_back(xPos);
+            sphereVertices.push_back(yPos);
+            sphereVertices.push_back(zPos);
+        }
+    for (int i = 0; i < Y_SEGMENTS; i++)
+        for (int j = 0; j < X_SEGMENTS; j++) {
+            sphereIndices.push_back(i * (X_SEGMENTS + 1) + j);
+            sphereIndices.push_back((i + 1) * (X_SEGMENTS + 1) + j);
+            sphereIndices.push_back((i + 1) * (X_SEGMENTS + 1) + j + 1);
+            sphereIndices.push_back(i * (X_SEGMENTS + 1) + j);
+            sphereIndices.push_back((i + 1) * (X_SEGMENTS + 1) + j + 1);
+            sphereIndices.push_back(i * (X_SEGMENTS + 1) + j + 1);
+        }
+    glGenVertexArrays(1, &vertex_array_object);
+    glGenBuffers(1, &vertex_buffer_object);
+    glBindVertexArray(vertex_array_object);
+    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer_object);
+    glBufferData(GL_ARRAY_BUFFER, sphereVertices.size() * sizeof(float), &sphereVertices[0], GL_STATIC_DRAW);
+    glGenBuffers(1, &element_buffer_object);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, element_buffer_object);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sphereIndices.size() * sizeof(int), &sphereIndices[0], GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+
+    // 轨道顶点生成
+    const float earthA = 6.0f, earthB = 4.5f;
+    for (int i = 0; i < ORBIT_SEGMENTS; ++i) {
+        float theta = (float)i / ORBIT_SEGMENTS * 2.0f * PI;
+        float x = earthA * std::cos(theta);
+        float z = earthB * std::sin(theta);
+        earthOrbitVertices.push_back(x);
+        earthOrbitVertices.push_back(0.0f);
+        earthOrbitVertices.push_back(z);
+    }
+    glGenVertexArrays(1, &earthOrbitVAO);
+    glGenBuffers(1, &earthOrbitVBO);
+    glBindVertexArray(earthOrbitVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, earthOrbitVBO);
+    glBufferData(GL_ARRAY_BUFFER, earthOrbitVertices.size() * sizeof(float), &earthOrbitVertices[0], GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+    const float moonA = 2.0f, moonB = 1.2f, moonTiltDeg = 20.0f;
+    float tiltRad = moonTiltDeg * PI / 180.0f;
+    for (int i = 0; i < ORBIT_SEGMENTS; ++i) {
+        float theta = (float)i / ORBIT_SEGMENTS * 2.0f * PI;
+        float x = moonA * std::cos(theta);
+        float z = moonB * std::sin(theta);
+        float y = z * std::sin(tiltRad);
+        float z_tilted = z * std::cos(tiltRad);
+        moonOrbitVertices.push_back(x);
+        moonOrbitVertices.push_back(y);
+        moonOrbitVertices.push_back(z_tilted);
+    }
+    glGenVertexArrays(1, &moonOrbitVAO);
+    glGenBuffers(1, &moonOrbitVBO);
+    glBindVertexArray(moonOrbitVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, moonOrbitVBO);
+    glBufferData(GL_ARRAY_BUFFER, moonOrbitVertices.size() * sizeof(float), &moonOrbitVertices[0], GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // 顶点着色器和片段着色器源码
+    const char *vertex_shader_source =
+        "#version 330 core\n"
+        "layout (location = 0) in vec3 vPos;\n"           // 位置变量的属性位置值为0
+        "out vec4 vColor;\n"           // 位置变量的属性位置值为0
+        "uniform mat4 transform;\n"
+        "uniform vec4 color;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = transform*vec4(vPos, 1.0);\n"
+        "    vColor = color;\n"
+        "}\n\0";
+    const char *fragment_shader_source =
+        "#version 330 core\n"
+        "in vec4 vColor;\n"                   // 输出的颜色向量
+        "out vec4 FragColor;\n"                   // 输出的颜色向量
+        "void main()\n"
+        "{\n"
+        "    FragColor = vColor;\n"
+        "}\n\0";
+
+    // 生成并编译着色器
+    // 顶点着色器
+    int success;
+    char info_log[512];
+    int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
+    glCompileShader(vertex_shader);
+    // 检查着色器是否成功编译，如果编译失败，打印错误信息
+    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        glGetShaderInfoLog(vertex_shader, 512, NULL, info_log);
+        std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << info_log << std::endl;
+    }
+    // 片段着色器
+    int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
+    glCompileShader(fragment_shader);
+    // 检查着色器是否成功编译，如果编译失败，打印错误信息
+    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        glGetShaderInfoLog(fragment_shader, 512, NULL, info_log);
+        std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << info_log << std::endl;
+    }
+    // 链接顶点和片段着色器至一个着色器程序
+    shader_program = glCreateProgram();
+    glAttachShader(shader_program, vertex_shader);
+    glAttachShader(shader_program, fragment_shader);
+    glLinkProgram(shader_program);
+    // 检查着色器是否成功链接，如果链接失败，打印错误信息
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shader_program, 512, NULL, info_log);
+        std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << info_log << std::endl;
+    }
+
+    // 删除着色器
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    glUseProgram(shader_program);
+
+    //设定点线面的属性
+    glPointSize(15);//设置点的大小
+    glLineWidth(5);//设置线宽
+
+    //启动剔除操作
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
+    //开启深度测试
+    glEnable(GL_DEPTH_TEST);
+}
+
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        switch (key)
+        {
+        case GLFW_KEY_ESCAPE:
+            glfwSetWindowShouldClose(window, GL_TRUE);
+            break;
+        case GLFW_KEY_UP:
+            camY += 1.0f;
+            break;
+        case GLFW_KEY_DOWN:
+            camY -= 1.0f;
+            break;
+        case GLFW_KEY_LEFT:
+            camX -= 1.0f;
+            break;
+        case GLFW_KEY_RIGHT:
+            camX += 1.0f;
+            break;
+        case GLFW_KEY_W:
+            camZ -= 1.0f;
+            break;
+        case GLFW_KEY_S:
+            camZ += 1.0f;
+            break;
+        case GLFW_KEY_1:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            break;
+        case GLFW_KEY_2:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            break;
+        case GLFW_KEY_3:
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+            break;
+        case GLFW_KEY_4:
+            glDisable(GL_CULL_FACE);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void Draw(void)
+{
+    // 清空颜色缓冲和深度缓冲区
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // 动态相机矩阵
+    vmath::mat4 view = vmath::lookat(
+        vmath::vec3(camX, camY, camZ),
+        vmath::vec3(0.0f, 0.0f, 0.0f),
+        vmath::vec3(0.0f, 1.0f, 0.0f));
+    vmath::mat4 proj = vmath::perspective(60, aspact, 1.0f, 500.0f);
+
+    unsigned int transformLoc = glGetUniformLocation(shader_program, "transform");
+    unsigned int colorLoc = glGetUniformLocation(shader_program, "color");
+
+    float t = (float)glfwGetTime();
+    // 轨道参数
+    const float earthA = 6.0f, earthB = 4.5f;
+    const float moonA = 2.0f, moonB = 1.2f, moonTiltDeg = 20.0f;
+    const float earthPeriod = 20.0f;
+    const float moonPeriod = 2.0f;
+    float tiltRad = moonTiltDeg * PI / 180.0f;
+
+    // 太阳（原点）
+    // 太阳大小由 scale(1.5f) 控制，调节此参数可改变太阳半径
+    vmath::mat4 sunTrans = proj * view * vmath::scale(2.0f); // <--- 太阳缩放因子
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, sunTrans);
+    GLfloat sunColor[4] = { 1.0f, 0.5f, 0.0f, 1.0f }; // 太阳颜色
+    glUniform4fv(colorLoc, 1, sunColor);
+    glBindVertexArray(vertex_array_object);
+    glDrawElements(GL_TRIANGLES, X_SEGMENTS * Y_SEGMENTS * 6, GL_UNSIGNED_INT, 0);
+
+    // 地球轨道（灰色线条）
+    vmath::mat4 orbitTrans = proj * view;
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, orbitTrans);
+    GLfloat orbitColor[4] = { 0.7f, 0.7f, 0.7f, 1.0f };
+    glUniform4fv(colorLoc, 1, orbitColor);
+    glBindVertexArray(earthOrbitVAO);
+    glDrawArrays(GL_LINE_LOOP, 0, ORBIT_SEGMENTS);
+
+    // 地球
+    float angEarth = -t * (2.0f * PI / earthPeriod);
+    float earthX = earthA * std::cos(angEarth);
+    float earthZ = earthB * std::sin(angEarth);
+    // 地球大小由 scale(0.7f) 控制，调节此参数可改变地球半径
+    vmath::mat4 earthTrans = proj * view * vmath::translate(earthX, 0.0f, earthZ) * vmath::scale(0.8f); // <--- 地球缩放因子
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, earthTrans);
+    GLfloat earthColor[4] = { 0.2f, 0.6f, 1.0f, 1.0f }; // 地球颜色
+    glUniform4fv(colorLoc, 1, earthColor);
+    glBindVertexArray(vertex_array_object);
+    glDrawElements(GL_TRIANGLES, X_SEGMENTS * Y_SEGMENTS * 6, GL_UNSIGNED_INT, 0);
+
+    // 月亮轨道（绿色线条，绕地球）
+    vmath::mat4 moonOrbitTrans = proj * view * vmath::translate(earthX, 0.0f, earthZ);
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, moonOrbitTrans);
+    GLfloat moonOrbitColor[4] = { 0.4f, 1.0f, 0.4f, 1.0f };
+    glUniform4fv(colorLoc, 1, moonOrbitColor);
+    glBindVertexArray(moonOrbitVAO);
+    glDrawArrays(GL_LINE_LOOP, 0, ORBIT_SEGMENTS);
+
+    // 月亮
+    float angMoon = -t * (2.0f * PI / moonPeriod);
+    float moonX = moonA * std::cos(angMoon);
+    float moonZ = moonB * std::sin(angMoon);
+    float moonY = moonZ * std::sin(tiltRad);
+    float moonZ_tilted = moonZ * std::cos(tiltRad);
+    // 月亮大小由 scale(0.3f) 控制，调节此参数可改变月亮半径
+    vmath::mat4 moonTrans = proj * view * vmath::translate(earthX, 0.0f, earthZ) * vmath::translate(moonX, moonY, moonZ_tilted) * vmath::scale(0.3f); // <--- 月亮缩放因子
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, moonTrans);
+    GLfloat moonColor[4] = { 0.8f, 0.8f, 0.85f, 1.0f }; // 月亮颜色
+    glUniform4fv(colorLoc, 1, moonColor);
+    glBindVertexArray(vertex_array_object);
+    glDrawElements(GL_TRIANGLES, X_SEGMENTS * Y_SEGMENTS * 6, GL_UNSIGNED_INT, 0);
+
+    glBindVertexArray(0);
+}
+
+void reshaper(GLFWwindow* window, int width, int height)
+{
+    glViewport(0, 0, width, height);
+    if (height == 0)
+    {
+        aspact = (float)width;
+    }
+    else
+    {
+        aspact = (float)width / (float)height;
+    }
+
+}
+
+int main()
+{
+    print_controls(); // 启动时显示控制说明
+    glfwInit(); // 初始化GLFW
+
+    // OpenGL版本为4.4，主次版本号均设为4
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 4);
+
+    // 使用核心模式(无需向后兼容性)
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    // 创建窗口(宽、高、窗口名称)
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Sphere", NULL, NULL);
+
+    if (window == NULL)
+    {
+        std::cout << "Failed to Create OpenGL Context" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+
+    // 将窗口的上下文设置为当前线程的主上下文
+    glfwMakeContextCurrent(window);
+
+    // 初始化GLAD，加载OpenGL函数指针地址的函数
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        std::cout << "Failed to initialize GLAD" << std::endl;
+        return -1;
+    }
+
+    initial();//初始化
+
+    //窗口大小改变时调用reshaper函数
+    glfwSetFramebufferSizeCallback(window, reshaper);
+
+    //窗口中有键盘操作时调用key_callback函数
+    glfwSetKeyCallback(window, key_callback);
+
+
+    while (!glfwWindowShouldClose(window))
+    {
+        Draw();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // 解绑和删除VAO和VBO
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDeleteVertexArrays(1, &vertex_array_object);
+    glDeleteBuffers(1, &vertex_buffer_object);
+
+    glfwDestroyWindow(window);
+
+    glfwTerminate();
+    return 0;
+}

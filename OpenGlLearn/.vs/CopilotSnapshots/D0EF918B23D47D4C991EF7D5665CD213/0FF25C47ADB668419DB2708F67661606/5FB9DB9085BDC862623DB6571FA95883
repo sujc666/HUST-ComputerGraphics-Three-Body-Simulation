@@ -1,0 +1,455 @@
+﻿//////////////////////////////////////////////////////////////////////////////
+//  ThreeBody.cpp
+//  日地月运动模型（三体均有纹理 + 光照 + 自发光太阳）
+//  - 地球、月球、太阳均使用独立纹理
+//  - 太阳自发光（不受光照影响）
+//  - 轨道高亮显示
+//  - 修复背面剔除问题
+//////////////////////////////////////////////////////////////////////////////
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
+
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <iostream>
+#include <vmath.h>
+#include <vector>
+#include <cmath>
+
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+float aspact = (float)4.0f / (float)3.0f;
+
+float camX = 0.0f, camY = 6.0f, camZ = 12.0f;
+
+std::vector<float> sphereVertices;      // pos(3) + normal(3) + tex(2)
+std::vector<unsigned int> sphereIndices;
+std::vector<float> earthOrbitVertices;
+std::vector<float> moonOrbitVertices;
+
+GLuint VAO_sphere, VBO_sphere, EBO_sphere;
+GLuint VAO_earthOrbit, VBO_earthOrbit;
+GLuint VAO_moonOrbit, VBO_moonOrbit;
+
+GLuint earthTexture = 0, moonTexture = 0, sunTexture = 0;
+GLuint shader_program;
+
+const int Y_SEGMENTS = 30;
+const int X_SEGMENTS = 30;
+const int ORBIT_SEGMENTS = 256;
+const GLfloat PI = 3.14159265358979323846f;
+
+// ———————————————————————— 工具函数 ————————————————————————
+GLuint loadTexture(const char* path) {
+    GLuint textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    int width, height, nrChannels;
+    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 0);
+    if (data) {
+        GLenum format = (nrChannels == 4) ? GL_RGBA : GL_RGB;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        std::cout << "[INFO] Loaded texture: " << path << " (" << width << "x" << height << ")" << std::endl;
+    }
+    else {
+        std::cout << "[WARNING] Failed to load texture: " << path << std::endl;
+    }
+    stbi_image_free(data);
+    return textureID;
+}
+
+void print_controls() {
+    std::cout << "\n==== 控制说明 ====" << std::endl;
+    std::cout << "方向键↑↓←→：移动摄像机视角" << std::endl;
+    std::cout << "W/S：摄像机前后移动" << std::endl;
+    std::cout << "1：线框模式  2：填充模式" << std::endl;
+    std::cout << "ESC：退出程序" << std::endl;
+    std::cout << "=================\n" << std::endl;
+}
+
+// ———————————————————————— 初始化 ————————————————————————
+void initial(void)
+{
+    // 生成球体（带法线+纹理坐标）
+    sphereVertices.clear();
+    for (int y = 0; y <= Y_SEGMENTS; y++) {
+        for (int x = 0; x <= X_SEGMENTS; x++) {
+            float xSegment = (float)x / (float)X_SEGMENTS;
+            float ySegment = (float)y / (float)Y_SEGMENTS;
+            float xPos = std::cos(xSegment * 2.0f * PI) * std::sin(ySegment * PI);
+            float yPos = std::cos(ySegment * PI);
+            float zPos = std::sin(xSegment * 2.0f * PI) * std::sin(ySegment * PI);
+            float nx = xPos, ny = yPos, nz = zPos;
+            float u = xSegment;
+            float v = 1.0f - ySegment; // 翻转V
+
+            sphereVertices.insert(sphereVertices.end(), {
+                xPos, yPos, zPos,
+                nx, ny, nz,
+                u, v
+                });
+        }
+    }
+
+    // 修复绕向：确保正面朝外（解决剔除问题）
+    sphereIndices.clear();
+    for (int i = 0; i < Y_SEGMENTS; i++) {
+        for (int j = 0; j < X_SEGMENTS; j++) {
+            unsigned int a = i * (X_SEGMENTS + 1) + j;
+            unsigned int b = (i + 1) * (X_SEGMENTS + 1) + j;
+            unsigned int c = (i + 1) * (X_SEGMENTS + 1) + j + 1;
+            unsigned int d = i * (X_SEGMENTS + 1) + j + 1;
+            // 逆时针顺序
+            sphereIndices.push_back(a); sphereIndices.push_back(c); sphereIndices.push_back(b);
+            sphereIndices.push_back(a); sphereIndices.push_back(d); sphereIndices.push_back(c);
+        }
+    }
+
+    // Sphere VAO
+    glGenVertexArrays(1, &VAO_sphere);
+    glGenBuffers(1, &VBO_sphere);
+    glGenBuffers(1, &EBO_sphere);
+    glBindVertexArray(VAO_sphere);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO_sphere);
+    glBufferData(GL_ARRAY_BUFFER, sphereVertices.size() * sizeof(float), sphereVertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO_sphere);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sphereIndices.size() * sizeof(unsigned int), sphereIndices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+
+    // 地球轨道
+    const float earthA = 6.0f, earthB = 4.5f;
+    for (int i = 0; i < ORBIT_SEGMENTS; ++i) {
+        float theta = (float)i / ORBIT_SEGMENTS * 2.0f * PI;
+        earthOrbitVertices = {
+            earthA * std::cos(theta),
+            0.0f,
+            earthB * std::sin(theta)
+        };
+    }
+    glGenVertexArrays(1, &VAO_earthOrbit);
+    glGenBuffers(1, &VBO_earthOrbit);
+    glBindVertexArray(VAO_earthOrbit);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO_earthOrbit);
+    glBufferData(GL_ARRAY_BUFFER, earthOrbitVertices.size() * sizeof(float), earthOrbitVertices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // 月亮轨道（带倾角）
+    const float moonA = 2.0f, moonB = 1.2f, moonTiltDeg = 20.0f;
+    float tiltRad = moonTiltDeg * PI / 180.0f;
+    moonOrbitVertices.clear();
+    for (int i = 0; i < ORBIT_SEGMENTS; ++i) {
+        float theta = (float)i / ORBIT_SEGMENTS * 2.0f * PI;
+        float x = moonA * std::cos(theta);
+        float z = moonB * std::sin(theta);
+        float y = z * std::sin(tiltRad);
+        float z_tilted = z * std::cos(tiltRad);
+        moonOrbitVertices.insert(moonOrbitVertices.end(), { x, y, z_tilted });
+    }
+    glGenVertexArrays(1, &VAO_moonOrbit);
+    glGenBuffers(1, &VBO_moonOrbit);
+    glBindVertexArray(VAO_moonOrbit);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO_moonOrbit);
+    glBufferData(GL_ARRAY_BUFFER, moonOrbitVertices.size() * sizeof(float), moonOrbitVertices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // 着色器
+    const char* vertexShaderSource = R"(
+        #version 330 core
+        layout (location = 0) in vec3 aPos;
+        layout (location = 1) in vec3 aNormal;
+        layout (location = 2) in vec2 aTexCoord;
+        out vec3 FragPos;
+        out vec3 Normal;
+        out vec2 TexCoord;
+        uniform mat4 transform;
+        void main()
+        {
+            FragPos = vec3(transform * vec4(aPos, 1.0));
+            Normal = mat3(transpose(inverse(mat3(transform)))) * aNormal;
+            TexCoord = aTexCoord;
+            gl_Position = transform * vec4(aPos, 1.0);
+        }
+    )";
+
+    const char* fragmentShaderSource = R"(
+        #version 330 core
+        in vec3 FragPos;
+        in vec3 Normal;
+        in vec2 TexCoord;
+        out vec4 FragColor;
+        uniform sampler2D diffuseTexture;
+        uniform vec3 lightPos1;
+        uniform vec3 lightPos2;
+        uniform vec3 viewPos;
+        uniform bool useTexture;
+        uniform bool isEmissive;
+        uniform vec3 objectColor;
+
+        vec3 calculateLight(vec3 lightPos, vec3 fragPos, vec3 normal, vec3 viewDir, vec3 color) {
+            vec3 lightColor = vec3(1.0, 1.0, 1.0);
+            vec3 ambient = 0.3 * lightColor;
+            vec3 lightDir = normalize(lightPos - fragPos);
+            float diff = max(dot(normal, lightDir), 0.0);
+            vec3 diffuse = diff * lightColor;
+            vec3 reflectDir = reflect(-lightDir, normal);
+            float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
+            vec3 specular = spec * lightColor;
+            return (ambient + diffuse + specular) * color;
+        }
+
+        void main()
+        {
+            vec3 color = useTexture ? texture(diffuseTexture, TexCoord).rgb : objectColor;
+            if (isEmissive) {
+                FragColor = vec4(color, 1.0);
+                return;
+            }
+            vec3 norm = normalize(Normal);
+            vec3 viewDir = normalize(viewPos - FragPos);
+            vec3 result = calculateLight(lightPos1, FragPos, norm, viewDir, color);
+            result += calculateLight(lightPos2, FragPos, norm, viewDir, color);
+            FragColor = vec4(result, 1.0);
+        }
+    )";
+
+    // 编译着色器
+    int success; char infoLog[512];
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vertexShaderSource, NULL);
+    glCompileShader(vs);
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vs, 512, NULL, infoLog);
+        std::cout << "Vertex shader compilation failed:\n" << infoLog << std::endl;
+    }
+
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fs);
+    glGetShaderiv(fs, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fs, 512, NULL, infoLog);
+        std::cout << "Fragment shader compilation failed:\n" << infoLog << std::endl;
+    }
+
+    shader_program = glCreateProgram();
+    glAttachShader(shader_program, vs);
+    glAttachShader(shader_program, fs);
+    glLinkProgram(shader_program);
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shader_program, 512, NULL, infoLog);
+        std::cout << "Shader program linking failed:\n" << infoLog << std::endl;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    glUseProgram(shader_program);
+
+    // 加载纹理
+    earthTexture = loadTexture("../image/earth.jpg");
+    moonTexture = loadTexture("../image/moon.jpg");
+    sunTexture = loadTexture("../image/sun.jpg");
+
+    // OpenGL 状态
+    glLineWidth(2.0f); // 轨道线宽
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE); 
+    glCullFace(GL_BACK);
+}
+
+// ———————————————————————— 渲染循环 ————————————————————————
+void Draw(void)
+{
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    vmath::mat4 view = vmath::lookat(vmath::vec3(camX, camY, camZ), vmath::vec3(0), vmath::vec3(0, 1, 0));
+    vmath::mat4 proj = vmath::perspective(60.0f, aspact, 1.0f, 500.0f);
+
+    glUseProgram(shader_program);
+    GLuint transformLoc = glGetUniformLocation(shader_program, "transform");
+    GLuint useTextureLoc = glGetUniformLocation(shader_program, "useTexture");
+    GLuint isEmissiveLoc = glGetUniformLocation(shader_program, "isEmissive");
+    GLuint objectColorLoc = glGetUniformLocation(shader_program, "objectColor");
+    GLuint textureLoc = glGetUniformLocation(shader_program, "diffuseTexture");
+    GLuint lightPos1Loc = glGetUniformLocation(shader_program, "lightPos1");
+    GLuint lightPos2Loc = glGetUniformLocation(shader_program, "lightPos2");
+    GLuint viewPosLoc = glGetUniformLocation(shader_program, "viewPos");
+
+    // 光源：太阳位置 + 背光灯
+    glUniform3f(lightPos1Loc, 0.0f, 0.0f, 0.0f);
+    glUniform3f(lightPos2Loc, 0.0f, 0.0f, -10.0f);
+    glUniform3f(viewPosLoc, camX, camY, camZ);
+
+    float t = (float)glfwGetTime();
+    const float earthA = 6.0f, earthB = 4.5f;
+    const float moonA = 2.0f, moonB = 1.2f, moonTiltDeg = 20.0f;
+    const float earthPeriod = 20.0f;
+    const float moonPeriod = 2.0f;
+    float tiltRad = moonTiltDeg * PI / 180.0f;
+
+    // —————— 太阳 ——————
+    vmath::mat4 sunTrans = proj * view * vmath::scale(2.0f);
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, sunTrans);
+    glUniform1i(isEmissiveLoc, true);
+    if (sunTexture) {
+        glUniform1i(useTextureLoc, true);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sunTexture);
+        glUniform1i(textureLoc, 0);
+    }
+    else {
+        glUniform1i(useTextureLoc, false);
+        glUniform3f(objectColorLoc, 1.0f, 0.9f, 0.5f);
+    }
+    glBindVertexArray(VAO_sphere);
+    glDrawElements(GL_TRIANGLES, (unsigned int)sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+    // —————— 地球轨道 ——————
+    vmath::mat4 orbitTrans = proj * view;
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, orbitTrans);
+    glUniform1i(isEmissiveLoc, false);
+    glUniform1i(useTextureLoc, false);
+    glUniform3f(objectColorLoc, 0.3f, 0.9f, 1.0f); // 青蓝色
+    glBindVertexArray(VAO_earthOrbit);
+    glDrawArrays(GL_LINE_LOOP, 0, ORBIT_SEGMENTS);
+
+    // —————— 地球 ——————
+    float angEarth = -t * (2.0f * PI / earthPeriod);
+    float earthX = earthA * std::cos(angEarth);
+    float earthZ = earthB * std::sin(angEarth);
+    vmath::mat4 earthTrans = proj * view * vmath::translate(earthX, 0.0f, earthZ) * vmath::scale(0.8f);
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, earthTrans);
+    glUniform1i(isEmissiveLoc, false);
+    if (earthTexture) {
+        glUniform1i(useTextureLoc, true);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, earthTexture);
+        glUniform1i(textureLoc, 0);
+    }
+    else {
+        glUniform1i(useTextureLoc, false);
+        glUniform3f(objectColorLoc, 0.2f, 0.6f, 1.0f);
+    }
+    glBindVertexArray(VAO_sphere);
+    glDrawElements(GL_TRIANGLES, (unsigned int)sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+    // —————— 月亮轨道 ——————
+    vmath::mat4 moonOrbitTrans = proj * view * vmath::translate(earthX, 0.0f, earthZ);
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, moonOrbitTrans);
+    glUniform3f(objectColorLoc, 0.9f, 0.9f, 0.3f); // 浅黄色
+    glBindVertexArray(VAO_moonOrbit);
+    glDrawArrays(GL_LINE_LOOP, 0, ORBIT_SEGMENTS);
+
+    // —————— 月亮 ——————
+    float angMoon = -t * (2.0f * PI / moonPeriod);
+    float moonX = moonA * std::cos(angMoon);
+    float moonZ = moonB * std::sin(angMoon);
+    float moonY = moonZ * std::sin(tiltRad);
+    float moonZ_tilted = moonZ * std::cos(tiltRad);
+    vmath::mat4 moonTrans = proj * view *
+        vmath::translate(earthX, 0.0f, earthZ) *
+        vmath::translate(moonX, moonY, moonZ_tilted) *
+        vmath::scale(0.3f);
+    glUniformMatrix4fv(transformLoc, 1, GL_FALSE, moonTrans);
+    if (moonTexture) {
+        glUniform1i(useTextureLoc, true);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, moonTexture);
+        glUniform1i(textureLoc, 0);
+    }
+    else {
+        glUniform1i(useTextureLoc, false);
+        glUniform3f(objectColorLoc, 0.8f, 0.8f, 0.85f);
+    }
+    glBindVertexArray(VAO_sphere);
+    glDrawElements(GL_TRIANGLES, (unsigned int)sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+    glBindVertexArray(0);
+}
+
+// ———————————————————————— 回调与主函数 ————————————————————————
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        switch (key) {
+        case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(window, true); break;
+        case GLFW_KEY_UP: camY += 1.0f; break;
+        case GLFW_KEY_DOWN: camY -= 1.0f; break;
+        case GLFW_KEY_LEFT: camX -= 1.0f; break;
+        case GLFW_KEY_RIGHT: camX += 1.0f; break;
+        case GLFW_KEY_W: camZ -= 1.0f; break;
+        case GLFW_KEY_S: camZ += 1.0f; break;
+        case GLFW_KEY_1: glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); break;
+        case GLFW_KEY_2: glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); break;
+        default: break;
+        }
+    }
+}
+
+void reshaper(GLFWwindow* window, int width, int height)
+{
+    glViewport(0, 0, width, height);
+    aspact = (height == 0) ? (float)width : (float)width / (float)height;
+}
+
+int main()
+{
+    print_controls();
+    if (!glfwInit()) return -1;
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 4);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Three Body", NULL, NULL);
+    if (!window) { glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(window);
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return -1;
+
+    initial();
+    glfwSetFramebufferSizeCallback(window, reshaper);
+    glfwSetKeyCallback(window, key_callback);
+
+    while (!glfwWindowShouldClose(window)) {
+        Draw();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // Cleanup
+    glDeleteVertexArrays(1, &VAO_sphere);
+    glDeleteBuffers(1, &VBO_sphere);
+    glDeleteBuffers(1, &EBO_sphere);
+    glDeleteVertexArrays(1, &VAO_earthOrbit);
+    glDeleteBuffers(1, &VBO_earthOrbit);
+    glDeleteVertexArrays(1, &VAO_moonOrbit);
+    glDeleteBuffers(1, &VBO_moonOrbit);
+    glDeleteTextures(1, &earthTexture);
+    glDeleteTextures(1, &moonTexture);
+    glDeleteTextures(1, &sunTexture);
+    glDeleteProgram(shader_program);
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
